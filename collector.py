@@ -1,14 +1,16 @@
 """Collector Agent: finds and extracts Reddit discussions mentioning Cars24.
 
-Workflow: search query -> find Reddit URLs via a pluggable search provider ->
-download each Reddit page -> extract title/subreddit/url/main post text ->
-clean the text. Responsible ONLY for this; does not score sentiment, predict
-reputation, or generate reports, and does not talk to the Reddit API — no
-Reddit credentials of any kind are used.
+Workflow: for each search query -> find Reddit URLs via a pluggable search
+provider -> download each Reddit page -> extract title/subreddit/url/main
+post text -> clean the text. Results are merged and deduplicated by URL
+across all queries. Responsible ONLY for this; does not score sentiment,
+predict reputation, or generate reports, and does not talk to the Reddit
+API — no Reddit credentials of any kind are used.
 """
 
 from __future__ import annotations
 
+import random
 import re
 import time
 from abc import ABC, abstractmethod
@@ -17,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from streamlit import write
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -24,8 +27,30 @@ USER_AGENT = (
 )
 REQUEST_TIMEOUT_SECONDS = 10
 REQUEST_DELAY_SECONDS = 1.0
-DEFAULT_QUERY = "cars24"
-DEFAULT_MAX_RESULTS = 25
+QUERY_DELAY_MIN_SECONDS = 1.0
+QUERY_DELAY_MAX_SECONDS = 2.0
+brand = "Cars24"
+
+templates = [
+    "{} review",
+    "{} experience",
+    "{} buying experience",
+    "{} selling experience",
+    "{} used car",
+    "{} purchase",
+    "{} reliable",
+    "{} customer support",
+    "{} refund",
+    "{} RC transfer",
+    "{} delivery",
+    "{} warranty",
+    "{} inspection",
+    "{} worth it",
+]
+
+DEFAULT_QUERIES = [template.format(brand) for template in templates]
+
+DEFAULT_MAX_RESULTS = 50
 
 
 class SearchProvider(ABC):
@@ -58,7 +83,7 @@ class DuckDuckGoSearchProvider(SearchProvider):
         urls: list[str] = []
         seen: set[str] = set()
         for link in soup.select("a.result__a"):
-            href = _unwrap_ddg_redirect(link.get("href", ""))
+            href = _unwrap_ddg_redirect(str(link.get("href") or ""))
             if "reddit.com" not in urlparse(href).netloc:
                 continue
             if href in seen:
@@ -151,11 +176,13 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _parse_int(text: str | None) -> int:
+def _parse_int(text: Any) -> int:
     """Extract the first integer found in `text`, or 0 if none."""
     if not text:
         return 0
-    match = re.search(r"-?\d+", text.replace(",", ""))
+    if isinstance(text, list):
+        text = text[0] if text else ""
+    match = re.search(r"-?\d+", str(text).replace(",", ""))
     return int(match.group()) if match else 0
 
 
@@ -197,24 +224,60 @@ def _fetch_post(url: str) -> dict[str, Any] | None:
     return post
 
 
+def _deduplicate_urls(urls: list[str]) -> list[str]:
+    """Remove duplicate Reddit URLs (exact match), keeping first-occurrence order."""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
 def collect_posts(
-    query: str = DEFAULT_QUERY,
+    queries: list[str] | None = None,
     max_results: int = DEFAULT_MAX_RESULTS,
     search_provider: SearchProvider | None = None,
 ) -> list[dict[str, Any]]:
-    """Search for Reddit discussions matching `query` and return cleaned records.
+    """Search for Reddit discussions matching each of `queries` and return cleaned records.
 
-    Each record has `title`, `subreddit`, `url`, and `text`, plus `score`/
-    `num_comments` metadata that the risk agent uses (e.g. to detect large
-    discussions).
+    Runs every query in turn and collects all resulting URLs first. Duplicate
+    URLs (the same Reddit discussion found under more than one query) are
+    removed BEFORE any page is downloaded. Continues past a query that
+    returns zero results. Each record has `title`, `subreddit`, `url`, and
+    `text`, plus `score`/`num_comments` metadata that the risk agent uses
+    (e.g. to detect large discussions).
     """
+    queries = queries or DEFAULT_QUERIES
     search_provider = search_provider or FallbackSearchProvider(
         [DuckDuckGoSearchProvider(), BingSearchProvider()]
     )
-    urls = search_provider.search(query, max_results)
 
+    # --- Phase 1: search every query, accumulating raw URLs (not yet deduplicated) ---
+    all_urls: list[str] = []
+    for i, query in enumerate(queries):
+        try:
+            urls = search_provider.search(query, max_results)
+        except Exception as exc:
+            print(f"[collector] Query {query!r} failed: {exc}")
+        else:
+            if not urls:
+                print(f"[collector] Query {query!r} returned 0 URLs, continuing to next query")
+            else:
+                all_urls.extend(urls)
+        finally:
+            if i < len(queries) - 1:
+                time.sleep(random.uniform(QUERY_DELAY_MIN_SECONDS, QUERY_DELAY_MAX_SECONDS))
+
+    # --- Phase 2: deduplicate BEFORE downloading anything, using the Reddit URL as the key ---
+    unique_urls = _deduplicate_urls(all_urls)
+    duplicates_removed = len(all_urls) - len(unique_urls)
+    print(f"[collector] Removed {duplicates_removed} duplicate URLs.")
+
+    # --- Phase 3: download and extract each unique post ---
     posts: list[dict[str, Any]] = []
-    for url in urls:
+    for url in unique_urls:
         try:
             post = _fetch_post(url)
         except requests.RequestException as exc:
@@ -224,4 +287,5 @@ def collect_posts(
             posts.append(post)
         time.sleep(REQUEST_DELAY_SECONDS)  # be polite to the pages we scrape
 
+    print(f"[collector] Collected {len(posts)} unique post(s) across {len(queries)} quer{'y' if len(queries) == 1 else 'ies'}")
     return posts

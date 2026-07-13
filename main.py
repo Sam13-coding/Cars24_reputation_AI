@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from claude_agent import filter_relevant_posts
-from collector import collect_posts
+import collector as _collector
 from report_generator import build_report, save_report
 from risk_agent import assess_posts
 
@@ -11,7 +11,12 @@ OUTPUT_DIR = Path("output")
 
 
 def main() -> None:
-    posts = collect_posts()
+    # Collector module may expose the posts-collecting function under different names.
+    collect_func = getattr(_collector, "collect_posts", None) or getattr(_collector, "collect", None)
+    if collect_func is None:
+        raise ImportError("collector module does not define collect_posts or collect()")
+
+    posts = collect_func()
     print(f"Collected {len(posts)} discussions.")
 
     relevant_posts = filter_relevant_posts(posts)
