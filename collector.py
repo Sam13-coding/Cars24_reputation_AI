@@ -167,6 +167,8 @@ def collect_posts(
     """
     search_provider = search_provider or SerpApiSearchProvider()
     urls = search_provider.search(query, max_results)
+    print("URLs returned:", len(urls))
+    print(urls)
 
     posts: list[dict[str, Any]] = []
     for url in urls:

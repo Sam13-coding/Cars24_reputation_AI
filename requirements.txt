@@ -2,6 +2,5 @@ streamlit
 requests
 beautifulsoup4
 pandas
-anthropic
 python-dotenv
 google-search-results
