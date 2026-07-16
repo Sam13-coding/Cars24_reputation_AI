@@ -1,5 +1,7 @@
+streamlit
 requests
 beautifulsoup4
-anthropic
 pandas
-streamlit
+anthropic
+python-dotenv
+google-search-results
