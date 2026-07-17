@@ -1,8 +1,8 @@
-"""Entry point: run the collector -> risk agent -> report generator pipeline."""
+"""Entry point: run the collector -> Gemini agent -> risk agent -> report generator pipeline."""
 
 from pathlib import Path
 
-from claude_agent import filter_relevant_posts
+from claude_agent import analyze_posts
 import collector as _collector
 from report_generator import build_report, save_report
 from risk_agent import assess_posts
@@ -19,8 +19,9 @@ def main() -> None:
     posts = collect_func()
     print(f"Collected {len(posts)} discussions.")
 
-    relevant_posts = filter_relevant_posts(posts)
-    print(f"Claude Agent kept {len(relevant_posts)}/{len(posts)} discussions as relevant to Cars24.")
+    relevant_posts, reputation_summary = analyze_posts(posts)
+    print(f"Gemini kept {len(relevant_posts)}/{len(posts)} discussions as relevant to Cars24.")
+    print(f"Gemini reputation summary: {reputation_summary}")
 
     scored_posts = assess_posts(relevant_posts)
     print("Scored discussions for reputation risk.")

@@ -1,6 +1,7 @@
-streamlit
 requests
 beautifulsoup4
 pandas
+streamlit
 python-dotenv
 google-search-results
+google-genai

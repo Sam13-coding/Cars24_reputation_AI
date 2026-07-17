@@ -14,7 +14,7 @@ import json as _json
 import pandas as pd
 import streamlit as st
 
-from claude_agent import filter_relevant_posts
+from claude_agent import GeminiUnavailableError, analyze_posts
 from collector import collect_posts
 from report_generator import build_report, save_report
 from risk_agent import PRIORITY_THRESHOLDS, assess_posts
@@ -349,7 +349,8 @@ def _run_pipeline(max_results: int) -> bool:
             posts = collect_posts(query="cars24", max_results=max_results)
 
             status.write(f"🧹 Filtering relevant posts... ({len(posts)} collected)")
-            relevant_posts = filter_relevant_posts(posts)
+            relevant_posts, reputation_summary = analyze_posts(posts)
+            status.write(f"🧠 Gemini reputation summary: {reputation_summary}")
 
             status.write(f"🧮 Scoring reputation... ({len(relevant_posts)} relevant)")
             scored_posts = assess_posts(relevant_posts)
@@ -364,6 +365,9 @@ def _run_pipeline(max_results: int) -> bool:
                 state="complete",
                 expanded=False,
             )
+    except GeminiUnavailableError as exc:
+        _error_card(str(exc))
+        return False
     except Exception as exc:  # noqa: BLE001 - surface any pipeline failure in a friendly card, never crash
         _error_card(f"Pipeline run failed: {exc}")
         return False
