@@ -38,6 +38,22 @@ waits on it via `concurrent.futures.Future.result(timeout=...)`, which is
 built on `threading.Condition.wait(timeout=...)` — a primitive that always
 returns control after N seconds whether or not the worker thread ever
 finishes. That is what makes the timeout here unconditional.
+
+Second-order gotcha found while hardening the summary step specifically: even
+with the above, a `ThreadPoolExecutor` worker is never a daemon thread, and
+`concurrent.futures._python_exit()` joins every worker thread ever created by
+ANY executor at interpreter shutdown — regardless of whether that executor
+was individually shut down. So a call that genuinely never returns leaves an
+abandoned worker that can still block the whole *process* from exiting, even
+though the calling function already returned a fallback result on schedule.
+Confirmed empirically with a permanently-hanging fake call: the function
+using `_run_with_hard_timeout` returned correctly within budget, but the
+interpreter then hung waiting to join the leaked thread. The summary step
+(`_run_summary_with_hard_timeout`) uses a plain `daemon=True` thread instead
+for exactly this reason — daemon threads are killed outright at interpreter
+exit, never joined. The batch path still uses `_run_with_hard_timeout`
+unchanged; this only matters in practice for a request that hangs forever
+rather than erroring, which batches have not been observed to do.
 """
 
 from __future__ import annotations
@@ -46,6 +62,7 @@ import concurrent.futures
 import json
 import os
 import re
+import threading
 import time
 import traceback
 from collections import Counter
@@ -244,9 +261,90 @@ def _call_gemini_batch(client: genai.Client, batch: list[dict[str, Any]]) -> dic
     return _request_json(client, _build_batch_prompt(batch), _BATCH_RESPONSE_SCHEMA)
 
 
+def _run_summary_with_hard_timeout(client: genai.Client, prompt: str, config: types.GenerateContentConfig) -> Any:
+    """Run the summary's generate_content() call under the same wall-clock timeout as
+    batches, but on a daemon thread instead of a ThreadPoolExecutor worker.
+
+    Deliberately not a call to _run_with_hard_timeout (the batch path): a
+    ThreadPoolExecutor worker is never a daemon thread, and
+    concurrent.futures._python_exit() joins every worker thread ever created
+    by ANY executor at interpreter shutdown, regardless of whether that
+    specific executor was shut down. So if generate_content() genuinely never
+    returns, the batch path's abandoned worker would keep the whole *process*
+    alive at exit even though the calling function already moved on and
+    returned a fallback result. Confirmed empirically: with a fake call that
+    sleeps forever, _summarize() built on _run_with_hard_timeout still
+    returned correctly within budget, but the interpreter then hung for the
+    leaked thread's full sleep before it could exit. A daemon thread avoids
+    this: daemon threads are killed outright at interpreter exit, never
+    joined, so a stuck summary call can never block the program from ending.
+    """
+    result_box: list[Any] = []
+    error_box: list[BaseException] = []
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            result_box.append(client.models.generate_content(model=MODEL_NAME, contents=prompt, config=config))
+        except BaseException as exc:  # re-raised on the calling thread below, once, if it arrives in time
+            error_box.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    if not done.wait(timeout=REQUEST_TIMEOUT_SECONDS):
+        raise _RetryableGeminiError(f"no response within {REQUEST_TIMEOUT_SECONDS}s")
+    if error_box:
+        exc = error_box[0]
+        if isinstance(exc, errors.APIError) and _is_retryable(exc):
+            raise _RetryableGeminiError(f"{exc.status or exc.code}") from exc
+        raise exc
+    return result_box[0]
+
+
 def _call_gemini_summary(client: genai.Client, analyzed_posts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Generate the single, final reputation summary from already-analyzed posts."""
-    return _request_json(client, _build_summary_prompt(analyzed_posts), _SUMMARY_RESPONSE_SCHEMA)
+    """Generate the single, final reputation summary from already-analyzed posts.
+
+    Intentionally does not go through _request_json (the shared batch/summary
+    helper it used before) — see _run_summary_with_hard_timeout's docstring
+    for why the summary path needs its own daemon-thread-based runner. Retry
+    count, backoff schedule, and per-attempt timeout reuse the exact same
+    constants as the batch path (MAX_RETRIES, RETRY_BACKOFF_SECONDS,
+    REQUEST_TIMEOUT_SECONDS), so the retry behavior itself is identical; only
+    the abandoned-thread lifecycle differs.
+    """
+    prompt = _build_summary_prompt(analyzed_posts)
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=_SUMMARY_RESPONSE_SCHEMA,
+        http_options=types.HttpOptions(
+            timeout=REQUEST_TIMEOUT_MS,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+
+    attempt = 0
+    while True:
+        try:
+            response = _run_summary_with_hard_timeout(client, prompt, config)
+        except _RetryableGeminiError as exc:
+            traceback.print_exc()
+            if attempt >= MAX_RETRIES:
+                raise GeminiUnavailableError(GEMINI_BUSY_MESSAGE) from exc
+            delay = RETRY_BACKOFF_SECONDS[attempt]
+            print(f"Retry {attempt + 1}/{MAX_RETRIES}...")
+            print(f"[claude_agent] Reason: {exc}. Waiting {delay}s before retrying...")
+            time.sleep(delay)
+            attempt += 1
+            continue
+        except errors.APIError:
+            traceback.print_exc()
+            raise
+
+        response_text = response.text
+        if response_text is None:
+            raise RuntimeError("Gemini returned no response body.")
+        return json.loads(response_text)
 
 
 def _fallback_analyze(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -302,15 +400,29 @@ def _analyze_batch(client: genai.Client, batch: list[dict[str, Any]]) -> tuple[l
 
 
 def _summarize(client: genai.Client, analyzed_posts: list[dict[str, Any]]) -> str:
-    """Generate the one final reputation summary, falling back to a rule-based digest on failure."""
+    """Generate the one final reputation summary, falling back to a rule-based digest on failure.
+
+    _call_gemini_summary applies the same 30s hard timeout and [2, 4, 8]s
+    retry backoff as the batch path (see _run_summary_with_hard_timeout for
+    why it uses its own daemon-thread runner rather than the batch path's).
+    The except clause here is intentionally broader than just
+    GeminiUnavailableError: this is the last step of analyze_posts(), so any
+    failure here (retry exhaustion, a non-retryable API error, an unparsable
+    response) must fall back to a deterministic summary rather than let an
+    exception escape and take down the whole pipeline on the final step.
+    """
+    print("Generating final summary...")
+    summary_text = None
     try:
         payload = _call_gemini_summary(client, analyzed_posts)
-        summary = payload.get("reputation_summary")
-        if summary:
-            return summary
+        summary_text = payload.get("reputation_summary")
     except GeminiUnavailableError as exc:
         print(f"[claude_agent] Summary request failed after retries ({exc}); using a rule-based summary instead.")
-    return _fallback_summary(analyzed_posts)
+    except Exception:
+        traceback.print_exc()
+        print("[claude_agent] Summary request failed unexpectedly; using a rule-based summary instead.")
+    print("Summary complete.")
+    return summary_text or _fallback_summary(analyzed_posts)
 
 
 def analyze_posts(posts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
