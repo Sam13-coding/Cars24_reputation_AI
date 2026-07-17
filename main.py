@@ -29,6 +29,7 @@ def main() -> None:
     report = build_report(scored_posts)
     save_report(report, scored_posts, OUTPUT_DIR)
     print(f"Report written to {OUTPUT_DIR / 'report.json'} and {OUTPUT_DIR / 'results.csv'}.")
+    print(f"[main] Final report total_discussions = {report['statistics']['total_discussions']}.")
 
 
 if __name__ == "__main__":

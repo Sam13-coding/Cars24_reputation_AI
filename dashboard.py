@@ -6,6 +6,7 @@ Run with: streamlit run dashboard.py
 from __future__ import annotations
 
 import html
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -346,18 +347,38 @@ def _run_pipeline(max_results: int) -> bool:
     try:
         with st.status("Running Cars24 reputation analysis...", expanded=True) as status:
             status.write("🔎 Collecting Reddit discussions...")
-            posts = collect_posts(query="cars24", max_results=max_results)
+            try:
+                posts = collect_posts(query="cars24", max_results=max_results)
+            except Exception as exc:
+                print(f"[dashboard] STEP 1-4 (collect_posts) raised an exception: {exc!r}")
+                traceback.print_exc()
+                raise
 
             status.write(f"🧹 Filtering relevant posts... ({len(posts)} collected)")
-            relevant_posts, reputation_summary = analyze_posts(posts)
+            try:
+                relevant_posts, reputation_summary = analyze_posts(posts)
+            except Exception as exc:
+                print(f"[dashboard] STEP 5-6 (analyze_posts) raised an exception: {exc!r}")
+                traceback.print_exc()
+                raise
             status.write(f"🧠 Gemini reputation summary: {reputation_summary}")
 
             status.write(f"🧮 Scoring reputation... ({len(relevant_posts)} relevant)")
-            scored_posts = assess_posts(relevant_posts)
+            try:
+                scored_posts = assess_posts(relevant_posts)
+            except Exception as exc:
+                print(f"[dashboard] STEP 7 (assess_posts) raised an exception: {exc!r}")
+                traceback.print_exc()
+                raise
 
             status.write("📄 Generating report...")
-            report = build_report(scored_posts)
-            save_report(report, scored_posts, OUTPUT_DIR)
+            try:
+                report = build_report(scored_posts)
+                save_report(report, scored_posts, OUTPUT_DIR)
+            except Exception as exc:
+                print(f"[dashboard] STEP 8 (build_report/save_report) raised an exception: {exc!r}")
+                traceback.print_exc()
+                raise
 
             status.write("✨ Preparing dashboard...")
             status.update(
@@ -366,9 +387,12 @@ def _run_pipeline(max_results: int) -> bool:
                 expanded=False,
             )
     except GeminiUnavailableError as exc:
+        print(f"[dashboard] _run_pipeline aborted: GeminiUnavailableError: {exc}")
         _error_card(str(exc))
         return False
     except Exception as exc:  # noqa: BLE001 - surface any pipeline failure in a friendly card, never crash
+        print(f"[dashboard] _run_pipeline aborted: {exc!r}")
+        traceback.print_exc()
         _error_card(f"Pipeline run failed: {exc}")
         return False
     return True
@@ -680,9 +704,21 @@ def main() -> None:
         report = load_report()
         results = load_results()
     except Exception as exc:  # noqa: BLE001 - surface a malformed/partial report without crashing
+        print(f"[dashboard] STEP 9: Dashboard failed to load report.json/results.csv: {exc!r}")
+        traceback.print_exc()
         _spacer(20)
         _error_card(f"Failed to load the latest report: {exc}")
         return
+
+    total_discussions = report.get("statistics", {}).get("total_discussions", 0)
+    print(f"STEP 9: Dashboard loaded {total_discussions} discussions")
+    if total_discussions == 0:
+        report_mtime = datetime.fromtimestamp(REPORT_PATH.stat().st_mtime) if REPORT_PATH.exists() else None
+        print(
+            "STEP 9 ZERO REASON: report.json's statistics.total_discussions is 0 "
+            f"(report last written: {report_mtime}). See STEP 1-8 above from the run that produced "
+            "this report.json for which stage first produced zero."
+        )
 
     _spacer(32)
     _render_kpis(report, results)

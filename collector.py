@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,7 @@ class SerpApiSearchProvider(SearchProvider):
             raise RuntimeError(
                 "SERPAPI_API_KEY not set. Add it to output/.env or pass api_key explicitly."
             )
+        print(f"[collector] SERPAPI_API_KEY loaded (ends in ...{self._api_key[-4:]}).")
 
     def search(self, query: str, max_results: int) -> list[str]:
         print(f"[collector] Searching SerpApi (Google) for: {query}")
@@ -62,6 +64,7 @@ class SerpApiSearchProvider(SearchProvider):
         urls: list[str] = []
         seen: set[str] = set()
         start = 0
+        last_response: dict[str, Any] = {}
 
         while len(urls) < max_results:
             params = {
@@ -72,10 +75,14 @@ class SerpApiSearchProvider(SearchProvider):
                 "api_key": self._api_key,
             }
             results = GoogleSearch(params).get_dict()
+            last_response = results
             if "error" in results:
+                print(f"[collector] SerpApi returned an error at start={start}: {results['error']}")
+                print(f"[collector] STEP 2 ZERO REASON: SerpApi API error. Full API response: {results!r}")
                 raise RuntimeError(f"SerpApi search failed: {results['error']}")
 
             organic_results = results.get("organic_results", [])
+            print(f"[collector] SerpApi page start={start}: {len(organic_results)} organic_result(s).")
             if not organic_results:
                 break
 
@@ -92,6 +99,11 @@ class SerpApiSearchProvider(SearchProvider):
 
             start += page_size
 
+        if not urls:
+            print(
+                f"[collector] STEP 2 ZERO REASON: SerpApi returned no organic_results for query {query!r}. "
+                f"Full API response: {last_response!r}"
+            )
         print(f"[collector] Found {len(urls)} Reddit URL(s) via SerpApi")
         return urls
 
@@ -142,13 +154,26 @@ def _extract_post(html: str, url: str) -> dict[str, Any] | None:
 def _fetch_post(url: str) -> dict[str, Any] | None:
     """Download a single Reddit discussion page and extract its content."""
     headers = {"User-Agent": USER_AGENT}
-    response = requests.get(_to_old_reddit(url), headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    fetch_url = _to_old_reddit(url)
+    response = requests.get(fetch_url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    print(f"[collector] GET {fetch_url} -> HTTP {response.status_code}, {len(response.content)} byte(s).")
     response.raise_for_status()
     print(f"[collector] Downloaded page: {url}")
 
     post = _extract_post(response.text, url)
     if post is None:
-        print(f"[collector] No post extracted from: {url}")
+        # Diagnostic only, not a behavior change: HTTP 200 with a body that doesn't match the
+        # expected old.reddit.com markup (e.g. a bot-check/interstitial/CAPTCHA/age-gate page)
+        # looks identical to a genuine markup change from here, so log everything needed to tell
+        # the two apart when this is investigated from server-side logs.
+        content_type = response.headers.get("Content-Type", "<no Content-Type header>")
+        print(
+            "[collector] STEP 4 page could not be parsed:\n"
+            f"[collector]   URL: {url}\n"
+            f"[collector]   HTTP status: {response.status_code}\n"
+            f"[collector]   Content-Type: {content_type}\n"
+            f"[collector]   First 500 chars of body: {response.text[:500]!r}"
+        )
     else:
         print(f"[collector] Extracted post: {post['title']}")
     return post
@@ -165,20 +190,50 @@ def collect_posts(
     `num_comments` metadata that the risk agent uses (e.g. to detect large
     discussions).
     """
+    print("STEP 1: Collector started")
     search_provider = search_provider or SerpApiSearchProvider()
-    urls = search_provider.search(query, max_results)
-    print("URLs returned:", len(urls))
-    print(urls)
+
+    try:
+        urls = search_provider.search(query, max_results)
+    except Exception as exc:
+        print(f"STEP 2: SerpAPI returned 0 URLs — search_provider.search() raised an exception: {exc!r}")
+        traceback.print_exc()
+        raise
+
+    print(f"STEP 2: SerpAPI returned {len(urls)} URLs")
+    if not urls:
+        print("STEP 2 ZERO REASON: see the [collector] STEP 2 ZERO REASON line above for the full API response.")
 
     posts: list[dict[str, Any]] = []
+    downloaded_count = 0
+    extracted_count = 0
+    failed_downloads = 0
     for url in urls:
         try:
             post = _fetch_post(url)
+            downloaded_count += 1
         except requests.RequestException as exc:
-            print(f"[collector] Failed to download {url}: {exc}")
+            print(f"[collector] Failed to download {url}: {exc!r}")
+            failed_downloads += 1
             continue
         if post is not None:
             posts.append(post)
+            extracted_count += 1
         time.sleep(REQUEST_DELAY_SECONDS)  # be polite to the pages we scrape
+
+    print(f"STEP 3: Downloaded {downloaded_count} Reddit pages")
+    if downloaded_count == 0 and urls:
+        print(
+            f"STEP 3 ZERO REASON: all {len(urls)} URL(s) failed to download "
+            f"({failed_downloads} raised a RequestException — see per-URL logs above for each one)."
+        )
+
+    print(f"STEP 4: Successfully extracted {extracted_count} posts")
+    if extracted_count == 0 and downloaded_count > 0:
+        print(
+            f"STEP 4 ZERO REASON: {downloaded_count} page(s) downloaded successfully but none matched "
+            "the expected old.reddit.com markup — see the STEP 4 page-could-not-be-parsed logs above "
+            "for each page's URL/status/Content-Type/body snippet."
+        )
 
     return posts

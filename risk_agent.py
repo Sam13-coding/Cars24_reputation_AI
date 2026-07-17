@@ -78,4 +78,7 @@ def assess_post(post: dict[str, Any]) -> dict[str, Any]:
 
 def assess_posts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Score every collected post for reputation risk."""
+    print(f"STEP 7: risk_agent received {len(posts)} posts")
+    if not posts:
+        print("STEP 7 ZERO REASON: claude_agent/analyze_posts() returned 0 relevant posts — see STEP 5/6.")
     return [assess_post(post) for post in posts]

@@ -81,6 +81,9 @@ def save_report(report: dict[str, Any], posts: list[dict[str, Any]], output_dir:
 
     report_path = output_dir / "report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"STEP 8: report_generator wrote {len(posts)} discussions")
+    if not posts:
+        print("STEP 8 ZERO REASON: risk_agent/assess_posts() received 0 posts — see STEP 7.")
 
     results_path = output_dir / "results.csv"
     with results_path.open("w", newline="", encoding="utf-8") as csv_file:

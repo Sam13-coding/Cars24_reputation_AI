@@ -185,6 +185,7 @@ def _build_client() -> genai.Client:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set.")
+    print(f"[claude_agent] GEMINI_API_KEY loaded (ends in ...{api_key[-4:]}).")
     return genai.Client(api_key=api_key)
 
 
@@ -487,7 +488,10 @@ def analyze_posts(posts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], st
     `sentiment`, `confidence`, and `reasoning`, otherwise unchanged — plus
     that one reputation summary.
     """
+    print(f"STEP 5: analyze_posts() received {len(posts)} posts")
     if not posts:
+        print("STEP 5 ZERO REASON: collect_posts() returned 0 posts — nothing to analyze, Gemini not called.")
+        print("STEP 6: Gemini returned 0 relevant posts")
         return [], DEFAULT_REPUTATION_SUMMARY
 
     try:
@@ -500,17 +504,33 @@ def analyze_posts(posts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], st
     total_batches = len(batches)
 
     analyzed_posts: list[dict[str, Any]] = []
-    gemini_succeeded = False
+    gemini_batches_succeeded = 0
+    gemini_batches_failed = 0
     for batch_index, batch in enumerate(batches, start=1):
         print(f"Batch {batch_index}/{total_batches}...")
         if client is None:
             analyzed_posts.extend(_fallback_analyze(batch))
             continue
-        batch_result, succeeded = _analyze_batch(client, batch)
+        try:
+            batch_result, succeeded = _analyze_batch(client, batch)
+        except Exception as exc:
+            print(f"STEP 6: batch {batch_index}/{total_batches} raised an unhandled exception: {exc!r}")
+            traceback.print_exc()
+            raise
         analyzed_posts.extend(batch_result)
-        gemini_succeeded = gemini_succeeded or succeeded
+        if succeeded:
+            gemini_batches_succeeded += 1
+        else:
+            gemini_batches_failed += 1
+    gemini_succeeded = gemini_batches_succeeded > 0
 
+    print(f"STEP 6: Gemini returned {len(analyzed_posts)} relevant posts")
     if not analyzed_posts:
+        print(
+            f"STEP 6 ZERO REASON: 0/{len(posts)} post(s) judged relevant across {total_batches} batch(es) "
+            f"({gemini_batches_succeeded} batch(es) used Gemini successfully, {gemini_batches_failed} fell "
+            f"back to keyword matching, client={'configured' if client is not None else 'not configured (no GEMINI_API_KEY)'})."
+        )
         return [], DEFAULT_REPUTATION_SUMMARY
 
     if gemini_succeeded and client is not None:
