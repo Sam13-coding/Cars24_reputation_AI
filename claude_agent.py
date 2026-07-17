@@ -87,6 +87,13 @@ REQUEST_TIMEOUT_SECONDS = 30  # hard, unconditional per-attempt budget (see modu
 REQUEST_TIMEOUT_MS = REQUEST_TIMEOUT_SECONDS * 1000  # also passed to httpx as a first line of defense
 GEMINI_BUSY_MESSAGE = "Gemini is temporarily experiencing high demand. Please try again in a few moments."
 
+# Free-tier RPM cap (GenerateRequestsPerMinutePerProjectPerModel-FreeTier) is easy to exceed once
+# batching issues several requests back to back. 12s between requests -> at most 60/12 = 5 req/min,
+# spacing every request (batch or summary, first attempt or retry) this far apart regardless of call
+# site keeps the whole run under that cap without tracking a rolling request count. Configurable via
+# env var because the free-tier limit is an external, changeable fact, not a code constant.
+REQUEST_INTERVAL_SECONDS = float(os.getenv("GEMINI_REQUEST_INTERVAL_SECONDS", "12"))
+
 _BRAND_PATTERN = re.compile(r"cars\s*-?\s*24", re.IGNORECASE)
 _FALLBACK_REASONING = "Keyword-based fallback: Gemini was unavailable for this batch."
 
@@ -97,6 +104,40 @@ class GeminiUnavailableError(RuntimeError):
 
 class _RetryableGeminiError(Exception):
     """Internal: this attempt failed in a way worth retrying (timeout, 503, RESOURCE_EXHAUSTED)."""
+
+
+class _RateLimiter:
+    """Centralized client-side throttle shared by every Gemini request — batch and summary alike.
+
+    Spaces consecutive requests at least REQUEST_INTERVAL_SECONDS apart by
+    wall-clock time, tracked from when each request is issued (not when it
+    finishes), so free-tier RPM is respected regardless of which call site
+    (a batch, a retry of a batch, or the summary) triggers the next request.
+    A single module-level instance is shared by _run_with_hard_timeout and
+    _run_summary_with_hard_timeout so both paths throttle against the same
+    clock rather than each getting their own independent allowance. The lock
+    makes this safe even though, in practice, calls happen sequentially.
+    """
+
+    def __init__(self, interval_seconds: float) -> None:
+        self._interval_seconds = interval_seconds
+        self._lock = threading.Lock()
+        self._last_request_at: float | None = None
+
+    def wait(self) -> None:
+        """Block, if needed, so at least interval_seconds have passed since the last request."""
+        with self._lock:
+            now = time.monotonic()
+            remaining = 0.0
+            if self._last_request_at is not None:
+                remaining = self._interval_seconds - (now - self._last_request_at)
+            if remaining > 0:
+                print(f"Waiting {remaining:.1f} seconds to respect Gemini free-tier rate limit...")
+                time.sleep(remaining)
+            self._last_request_at = time.monotonic()
+
+
+_rate_limiter = _RateLimiter(REQUEST_INTERVAL_SECONDS)
 
 
 _BATCH_RESPONSE_SCHEMA = {
@@ -189,7 +230,11 @@ def _run_with_hard_timeout(client: genai.Client, prompt: str, config: types.Gene
     whether or not the worker thread has finished. A future that times out is
     abandoned (`shutdown(wait=False)`), never waited on, so this call itself
     can never hang past the configured budget.
+
+    Throttled by the shared _rate_limiter before the request is issued, so
+    every attempt — including retries — respects the free-tier RPM cap.
     """
+    _rate_limiter.wait()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(client.models.generate_content, model=MODEL_NAME, contents=prompt, config=config)
     try:
@@ -278,7 +323,12 @@ def _run_summary_with_hard_timeout(client: genai.Client, prompt: str, config: ty
     leaked thread's full sleep before it could exit. A daemon thread avoids
     this: daemon threads are killed outright at interpreter exit, never
     joined, so a stuck summary call can never block the program from ending.
+
+    Throttled by the shared _rate_limiter before the request is issued, same
+    as the batch path, so the summary request (and any retries of it) also
+    respects the free-tier RPM cap.
     """
+    _rate_limiter.wait()
     result_box: list[Any] = []
     error_box: list[BaseException] = []
     done = threading.Event()
